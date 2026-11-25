@@ -1,243 +1,218 @@
+import os
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Generator
+
 from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse, JSONResponse
-from urllib.parse import urlparse
+from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
-import requests
 
-app = FastAPI()
+# ---- ffmpeg (mp3 convert এর জন্য) ----
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception as _e:
+    FFMPEG_PATH = None
+    print(f"[startup] ffmpeg unavailable: {_e}")
 
-# HTTP Session
-http = requests.Session()
-http.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/130.0.0.0 Safari/537.36"
-    )
-})
+# ---- cookies paths ----
+COOKIE_SRC = "/etc/secrets/cookies.txt"   # Render Secret File (READ-ONLY)
+COOKIE_RW  = "/tmp/cookies.txt"           # writable copy (yt-dlp rotation এর জন্য)
+
+app = FastAPI(title="AuraGrab Backend")
 
 
-def is_youtube_url(url: str) -> bool:
+# ============================================================
+# Startup: cookies কে /tmp তে copy করি যাতে yt-dlp লিখতে পারে
+# ============================================================
+def _prepare_cookies() -> bool:
+    if not os.path.exists(COOKIE_SRC):
+        return False
     try:
-        host = (urlparse(url).hostname or "").lower()
-
-        return (
-            host == "youtu.be"
-            or host == "youtube.com"
-            or host.endswith(".youtube.com")
-        )
-    except Exception:
+        shutil.copy2(COOKIE_SRC, COOKIE_RW)
+        os.chmod(COOKIE_RW, 0o600)
+        return True
+    except Exception as e:
+        print(f"[startup] cookie copy failed: {e}")
         return False
 
 
-# ==============================
-# HOME / HEALTH CHECK
-# ==============================
+@app.on_event("startup")
+def _on_startup():
+    ok = _prepare_cookies()
+    print(f"[startup] cookie_src_exists={os.path.exists(COOKIE_SRC)} rw_copy={ok}")
+    print(f"[startup] ffmpeg={FFMPEG_PATH}")
+    print(f"[startup] yt-dlp version={yt_dlp.version.__version__}")
 
+
+def _cookiefile() -> str | None:
+    if os.path.exists(COOKIE_RW):
+        return COOKIE_RW
+    if os.path.exists(COOKIE_SRC):
+        return COOKIE_SRC
+    return None
+
+
+def _base_opts() -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
+        "extractor_args": {
+            "youtube": {
+                # mweb সবচেয়ে বেশি কাজ করে datacenter IP-তে
+                "player_client": ["mweb", "web_safari", "android_vr"],
+            }
+        },
+    }
+    cf = _cookiefile()
+    if cf:
+        opts["cookiefile"] = cf
+    if FFMPEG_PATH:
+        opts["ffmpeg_location"] = FFMPEG_PATH
+    return opts
+
+
+# ============================================================
+# Routes
+# ============================================================
 @app.get("/")
 def root():
-    return {
-        "status": "AURA GRAB backend is running"
+    return {"status": "ok", "service": "auragrab-backend"}
+
+
+@app.get("/debug/cookies")
+def debug_cookies():
+    res = {
+        "src_path": COOKIE_SRC,
+        "src_exists": os.path.exists(COOKIE_SRC),
+        "rw_path": COOKIE_RW,
+        "rw_exists": os.path.exists(COOKIE_RW),
+        "ffmpeg": FFMPEG_PATH is not None,
+        "yt_dlp_version": yt_dlp.version.__version__,
     }
+    if os.path.exists(COOKIE_SRC):
+        data = Path(COOKIE_SRC).read_text(errors="replace")
+        names = []
+        for line in data.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                names.append(parts[5])
+        res.update({
+            "size_bytes": len(data),
+            "cookie_count": len(names),
+            "has_SAPISID": "SAPISID" in names,
+            "has_secure_3PAPISID": "__Secure-3PAPISID" in names,
+            "has_LOGIN_INFO": "LOGIN_INFO" in names,
+            "has_secure_3PSID": "__Secure-3PSID" in names,
+            "src_writable": os.access(COOKIE_SRC, os.W_OK),
+            "rw_writable": os.access(COOKIE_RW, os.W_OK) if os.path.exists(COOKIE_RW) else False,
+        })
+    return res
 
-
-# ==============================
-# VIDEO INFO
-# ==============================
 
 @app.get("/info")
-def info(url: str = Query(...)):
-
+def info(url: str = Query(..., description="video url")):
     try:
-
-        # YouTube Metadata using oEmbed
-        if is_youtube_url(url):
-
-            response = http.get(
-                "https://www.youtube.com/oembed",
-                params={
-                    "url": url,
-                    "format": "json"
-                },
-                timeout=20
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            return {
-                "title": data.get("title"),
-                "thumbnail": data.get("thumbnail_url"),
-                "author": data.get("author_name"),
-                "provider": "YouTube"
-            }
-
-        # Other Platforms: Existing yt-dlp method
-        ydl_opts = {
-            "quiet": True,
-            "noplaylist": True,
-            "skip_download": True
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            data = ydl.extract_info(
-                url,
-                download=False
-            )
-
+        opts = _base_opts()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
         return {
             "title": data.get("title"),
             "thumbnail": data.get("thumbnail"),
-            "duration": data.get("duration")
+            "author": data.get("uploader") or data.get("channel"),
+            "duration": data.get("duration"),
+            "provider": data.get("extractor_key") or data.get("extractor"),
         }
-
-    except requests.HTTPError as e:
-
-        status = (
-            e.response.status_code
-            if e.response is not None
-            else 502
-        )
-
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "YouTube metadata request failed",
-                "upstream_status": status
-            }
-        )
-
     except Exception as e:
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(e)
-            }
-        )
+        return JSONResponse(status_code=200, content={"error": f"extract failed: {e}"})
 
 
-# ==============================
-# VIDEO DOWNLOAD
-# ==============================
+def _stream_file(path: str, chunk: int = 64 * 1024) -> Generator[bytes, None, None]:
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(chunk)
+            if not data:
+                break
+            yield data
+
 
 @app.get("/download")
 def download(
-    url: str = Query(...),
-    format: str = Query("mp4")
+    url: str = Query(..., description="video url"),
+    format: str = Query("mp4", description="mp4 or mp3"),
 ):
+    fmt = (format or "mp4").lower().strip()
+    if fmt not in ("mp4", "mp3"):
+        return JSONResponse(status_code=400, content={"error": "format must be mp4 or mp3"})
 
-    if format not in ("mp4", "mp3"):
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "format must be mp4 or mp3"
-            }
-        )
-
-    ydl_opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "format": (
-            "best[ext=mp4]/best"
-            if format == "mp4"
-            else "bestaudio/best"
-        )
-    }
-
+    tmpdir = tempfile.mkdtemp(prefix="auragrab_")
     try:
+        opts = _base_opts()
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        if fmt == "mp3":
+            if not FFMPEG_PATH:
+                return JSONResponse(
+                    status_code=200,
+                    content={"error": "ffmpeg missing on server (mp3 unavailable)"},
+                )
+            opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            })
+        else:
+            # ffmpeg ছাড়াই কাজ করে
+            opts.update({
+                "format": "best[ext=mp4]/best[ext=webm]/best",
+            })
 
-            info_data = ydl.extract_info(
-                url,
-                download=False
-            )
+        opts["outtmpl"] = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    except Exception as e:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=True)
+            base = ydl.prepare_filename(data)
 
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": f"extract failed: {e}"
-            }
-        )
+        # final file খুঁজি (mp3 postprocess এ extension বদলায়)
+        out_path = None
+        if os.path.exists(base):
+            out_path = base
+        else:
+            for f in os.listdir(tmpdir):
+                if f.endswith(".part") or f.endswith(".ytdl"):
+                    continue
+                out_path = os.path.join(tmpdir, f)
+                break
+        if not out_path or not os.path.exists(out_path):
+            raise FileNotFoundError("downloaded file not found on server")
 
-    # Find direct media URL
-    direct_url = info_data.get("url")
+        size = os.path.getsize(out_path)
+        mime = "audio/mpeg" if fmt == "mp3" else "video/mp4"
+        vid_id = data.get("id") or "video"
+        filename = f"auragrab_{vid_id}.{fmt}"
 
-    if (
-        not direct_url
-        and info_data.get("requested_downloads")
-    ):
-        rd = info_data["requested_downloads"]
-
-        if rd:
-            direct_url = rd[0].get("url")
-
-    if (
-        not direct_url
-        and info_data.get("formats")
-    ):
-        formats = info_data["formats"]
-
-        if formats:
-            direct_url = formats[-1].get("url")
-
-    if not direct_url:
-
-        return JSONResponse(
-            status_code=404,
-            content={
-                "error": "No downloadable stream found"
-            }
-        )
-
-    # Download Headers
-    headers = info_data.get("http_headers") or {}
-
-    title = info_data.get("title", "download")
-
-    safe_title = "".join(
-        c for c in title
-        if c.isalnum() or c in " ._-"
-    ).strip()[:60] or "download"
-
-    ext = "mp4" if format == "mp4" else "mp3"
-
-    filename = f"{safe_title}.{ext}"
-
-    media_type = (
-        "video/mp4"
-        if format == "mp4"
-        else "audio/mpeg"
-    )
-
-    # Stream media
-    def stream():
-
-        with requests.get(
-            direct_url,
-            headers=headers,
-            stream=True,
-            timeout=120
-        ) as response:
-
-            response.raise_for_status()
-
-            for chunk in response.iter_content(
-                chunk_size=65536
-            ):
-
-                if chunk:
+        def _iter_and_cleanup():
+            try:
+                for chunk in _stream_file(out_path):
                     yield chunk
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
-    return StreamingResponse(
-        stream(),
-        media_type=media_type,
-        headers={
-            "Content-Disposition":
-            f'attachment; filename="{filename}"'
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(size),
+            "Cache-Control": "no-store",
         }
-            )
+        return StreamingResponse(_iter_and_cleanup(), media_type=mime, headers=headers)
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return JSONResponse(status_code=200, content={"error": f"download failed: {e}"})
