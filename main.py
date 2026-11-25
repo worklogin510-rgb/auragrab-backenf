@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -7,8 +8,20 @@ import requests
 
 app = FastAPI()
 
-# Render এর "Secret Files" ফিচার দিয়ে আপলোড করা হলে এই পাথেই পাওয়া যাবে
-COOKIE_FILE = "/etc/secrets/cookies.txt"
+# Render এর "Secret Files" ফিচার দিয়ে আপলোড করা হলে এই পাথেই পাওয়া যাবে (read-only)
+SECRET_COOKIE_FILE = "/etc/secrets/cookies.txt"
+# yt-dlp cookie ব্যবহারের পর ওই ফাইলেই আপডেট লিখতে চেষ্টা করে, তাই একটা
+# writable কপি বানিয়ে সেটাই আসলে ব্যবহার করবো
+WRITABLE_COOKIE_FILE = "/tmp/cookies.txt"
+
+
+def ensure_writable_cookie_file():
+    if os.path.exists(SECRET_COOKIE_FILE) and not os.path.exists(WRITABLE_COOKIE_FILE):
+        shutil.copyfile(SECRET_COOKIE_FILE, WRITABLE_COOKIE_FILE)
+    return os.path.exists(WRITABLE_COOKIE_FILE)
+
+
+COOKIES_AVAILABLE = ensure_writable_cookie_file()
 
 
 def base_opts():
@@ -19,8 +32,8 @@ def base_opts():
         # এটা সেগুলোকেও candidate হিসেবে বিবেচনা করতে বলে
         "extractor_args": {"youtube": {"formats": ["missing_pot"]}},
     }
-    if os.path.exists(COOKIE_FILE):
-        opts["cookiefile"] = COOKIE_FILE
+    if COOKIES_AVAILABLE:
+        opts["cookiefile"] = WRITABLE_COOKIE_FILE
     return opts
 
 
@@ -41,7 +54,7 @@ def extract_with_fallback(url: str, format_candidates):
 
 @app.get("/")
 def root():
-    return {"status": "AURA GRAB backend is running", "cookies_loaded": os.path.exists(COOKIE_FILE)}
+    return {"status": "AURA GRAB backend is running", "cookies_loaded": COOKIES_AVAILABLE}
 
 
 @app.get("/info")
