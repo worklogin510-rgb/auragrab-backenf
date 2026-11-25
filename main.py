@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 import yt_dlp
@@ -5,17 +7,28 @@ import requests
 
 app = FastAPI()
 
+# Render এর "Secret Files" ফিচার দিয়ে আপলোড করা হলে এই পাথেই পাওয়া যাবে
+COOKIE_FILE = "/etc/secrets/cookies.txt"
+
+
+def base_opts():
+    opts = {"quiet": True, "noplaylist": True}
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
+    return opts
+
 
 @app.get("/")
 def root():
-    # Render এর health-check আর তুমি নিজে টেস্ট করার জন্য
-    return {"status": "AURA GRAB backend is running"}
+    # cookies_loaded দেখে বোঝা যাবে cookie ফাইলটা ঠিকভাবে বসেছে কিনা
+    return {"status": "AURA GRAB backend is running", "cookies_loaded": os.path.exists(COOKIE_FILE)}
 
 
 @app.get("/info")
 def info(url: str = Query(...)):
     """ভিডিওর টাইটেল/থাম্বনেইল আনে, প্রিভিউ কার্ডে দেখানোর জন্য।"""
-    ydl_opts = {"quiet": True, "noplaylist": True, "skip_download": True}
+    ydl_opts = base_opts()
+    ydl_opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             data = ydl.extract_info(url, download=False)
@@ -36,11 +49,8 @@ def download(url: str = Query(...), format: str = Query("mp4")):
     byte-by-byte স্ট্রিম করে পাঠায়। Android অ্যাপ এই endpoint-কেই
     একটা সাধারণ ফাইল-ডাউনলোড লিঙ্কের মতো ব্যবহার করে।
     """
-    ydl_opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "format": "best[ext=mp4]/best" if format == "mp4" else "bestaudio/best",
-    }
+    ydl_opts = base_opts()
+    ydl_opts["format"] = "best[ext=mp4]/best" if format == "mp4" else "bestaudio/best"
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
