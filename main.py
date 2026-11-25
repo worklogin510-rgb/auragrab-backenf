@@ -35,8 +35,14 @@ def _prepare_cookies() -> bool:
 @app.on_event("startup")
 def _startup():
     _prepare_cookies()
+    # Deno PATH এ যোগ করি (Render এর /usr/local/bin read-only)
+    deno_bin_dir = "/opt/render/.deno/bin"
+    if os.path.exists(deno_bin_dir + "/deno"):
+        os.environ["PATH"] = deno_bin_dir + ":" + os.environ.get("PATH", "")
+        os.environ["DENO_INSTALL"] = "/opt/render/.deno"
+    deno_which = shutil.which("deno")
     print(f"[startup] cookies={os.path.exists(COOKIE_RW)} "
-          f"ffmpeg={bool(FFMPEG_PATH)} deno={shutil.which('deno')}")
+          f"ffmpeg={bool(FFMPEG_PATH)} deno={deno_which}")
 
 
 def _cookiefile():
@@ -67,9 +73,6 @@ def _base_opts():
         opts["cookiefile"] = cf
     if FFMPEG_PATH:
         opts["ffmpeg_location"] = FFMPEG_PATH
-    deno = shutil.which("deno")
-    if deno:
-        opts["js_runtimes"] = {"deno": {"path": deno}}
     return opts
 
 
@@ -82,6 +85,39 @@ def root():
         "ffmpeg": bool(FFMPEG_PATH),
         "cookies": os.path.exists(COOKIE_RW),
     }
+
+
+@app.get("/debug/cookies")
+def debug_cookies():
+    res = {
+        "src_exists": os.path.exists(COOKIE_SRC),
+        "rw_exists": os.path.exists(COOKIE_RW),
+        "ffmpeg": bool(FFMPEG_PATH),
+        "deno": shutil.which("deno"),
+        "yt_dlp_version": yt_dlp.version.__version__,
+    }
+    if os.path.exists(COOKIE_SRC):
+        data = open(COOKIE_SRC, "rb").read().decode(errors="replace")
+        names = []
+        for line in data.splitlines():
+            if not line:
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                names.append(parts[5])
+        res.update({
+            "size_bytes": len(data),
+            "cookie_count": len(names),
+            "has_SAPISID": "SAPISID" in names,
+            "has_secure_3PAPISID": "__Secure-3PAPISID" in names,
+            "has_LOGIN_INFO": "LOGIN_INFO" in names,
+            "has_secure_3PSID": "__Secure-3PSID" in names,
+        })
+    return res
 
 
 @app.get("/info")
@@ -106,7 +142,6 @@ def info(url: str = Query(...)):
 
 @app.get("/formats")
 def formats(url: str = Query(...)):
-    """কোন কোন video quality available দেখায়"""
     try:
         opts = _base_opts()
         with yt_dlp.YoutubeDL(opts) as ydl:
