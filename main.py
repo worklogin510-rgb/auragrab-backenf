@@ -28,9 +28,16 @@ def base_opts():
     opts = {
         "quiet": True,
         "noplaylist": True,
-        # cookies থাকার পরেও কিছু ফরম্যাট PO-token এর কারণে লুকানো থাকে —
-        # এটা সেগুলোকেও candidate হিসেবে বিবেচনা করতে বলে
-        "extractor_args": {"youtube": {"formats": ["missing_pot"]}},
+        "extractor_args": {
+            "youtube": {
+                # tv / web_embedded / android_vr — yt-dlp এর নিজস্ব ডকুমেন্টেশন
+                # অনুযায়ী এই ক্লায়েন্টগুলোর PO-token লাগে না, তাই আগে এগুলো try করবে
+                "player_client": ["tv", "web_embedded", "android_vr", "web"],
+                # cookies থাকার পরেও কিছু ফরম্যাট PO-token এর কারণে লুকানো থাকে —
+                # এটা সেগুলোকেও candidate হিসেবে বিবেচনা করতে বলে (fallback হিসেবে)
+                "formats": ["missing_pot"],
+            }
+        },
     }
     if COOKIES_AVAILABLE:
         opts["cookiefile"] = WRITABLE_COOKIE_FILE
@@ -50,6 +57,34 @@ def extract_with_fallback(url: str, format_candidates):
             last_error = str(e)
             continue
     return None, last_error
+
+
+@app.get("/formats")
+def list_formats(url: str = Query(...)):
+    """
+    ডায়াগনস্টিক endpoint — কোনো format নির্বাচন না করে, ভিডিওর
+    আসল available format গুলো যা যা আছে সব দেখায়। কোনো format
+    error এলে, আন্দাজ না করে এই endpoint দিয়ে সরাসরি দেখা যাবে
+    আসলে কী কী পাওয়া যাচ্ছে।
+    """
+    try:
+        opts = base_opts()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+        formats = [
+            {
+                "itag": f.get("format_id"),
+                "ext": f.get("ext"),
+                "note": f.get("format_note"),
+                "has_url": bool(f.get("url")),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+            }
+            for f in data.get("formats", [])
+        ]
+        return {"title": data.get("title"), "format_count": len(formats), "formats": formats}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/")
