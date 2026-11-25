@@ -1,235 +1,120 @@
 import os
-import shutil
-import tempfile
-from typing import Generator
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import yt_dlp
+import requests
 
-# ---- ffmpeg (mp3 + merge এর জন্য) ----
-try:
-    import imageio_ffmpeg
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception:
-    FFMPEG_PATH = None
+app = FastAPI()
 
-# ---- cookies ----
-COOKIE_SRC = "/etc/secrets/cookies.txt"
-COOKIE_RW = "/tmp/cookies.txt"
-
-app = FastAPI(title="AuraGrab Backend")
+# Render এর "Secret Files" ফিচার দিয়ে আপলোড করা হলে এই পাথেই পাওয়া যাবে
+COOKIE_FILE = "/etc/secrets/cookies.txt"
 
 
-def _prepare_cookies() -> bool:
-    if not os.path.exists(COOKIE_SRC):
-        return False
-    try:
-        shutil.copy2(COOKIE_SRC, COOKIE_RW)
-        os.chmod(COOKIE_RW, 0o600)
-        return True
-    except Exception:
-        return False
-
-
-@app.on_event("startup")
-def _startup():
-    _prepare_cookies()
-    # Deno PATH এ যোগ করি (Render এর /usr/local/bin read-only)
-    deno_bin_dir = "/opt/render/.deno/bin"
-    if os.path.exists(deno_bin_dir + "/deno"):
-        os.environ["PATH"] = deno_bin_dir + ":" + os.environ.get("PATH", "")
-        os.environ["DENO_INSTALL"] = "/opt/render/.deno"
-    deno_which = shutil.which("deno")
-    print(f"[startup] cookies={os.path.exists(COOKIE_RW)} "
-          f"ffmpeg={bool(FFMPEG_PATH)} deno={deno_which}")
-
-
-def _cookiefile():
-    if os.path.exists(COOKIE_RW):
-        return COOKIE_RW
-    if os.path.exists(COOKIE_SRC):
-        return COOKIE_SRC
-    return None
-
-
-def _base_opts():
+def base_opts():
     opts = {
         "quiet": True,
-        "no_warnings": True,
         "noplaylist": True,
-        "no_check_formats": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 30,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android", "ios"],
-            }
-        },
+        # cookies থাকার পরেও কিছু ফরম্যাট PO-token এর কারণে লুকানো থাকে —
+        # এটা সেগুলোকেও candidate হিসেবে বিবেচনা করতে বলে
+        "extractor_args": {"youtube": {"formats": ["missing_pot"]}},
     }
-    cf = _cookiefile()
-    if cf:
-        opts["cookiefile"] = cf
-    if FFMPEG_PATH:
-        opts["ffmpeg_location"] = FFMPEG_PATH
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
     return opts
 
 
-# ---------- Routes ----------
+def extract_with_fallback(url: str, format_candidates):
+    """একাধিক format selector ক্রমানুসারে try করে, প্রথমটা যেটা কাজ করে সেটা দিয়ে info ফেরত দেয়।"""
+    last_error = None
+    for fmt in format_candidates:
+        try:
+            opts = base_opts()
+            opts["format"] = fmt
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False), None
+        except Exception as e:
+            last_error = str(e)
+            continue
+    return None, last_error
+
+
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "deno": shutil.which("deno"),
-        "ffmpeg": bool(FFMPEG_PATH),
-        "cookies": os.path.exists(COOKIE_RW),
-    }
-
-
-@app.get("/debug/cookies")
-def debug_cookies():
-    res = {
-        "src_exists": os.path.exists(COOKIE_SRC),
-        "rw_exists": os.path.exists(COOKIE_RW),
-        "ffmpeg": bool(FFMPEG_PATH),
-        "deno": shutil.which("deno"),
-        "yt_dlp_version": yt_dlp.version.__version__,
-    }
-    if os.path.exists(COOKIE_SRC):
-        data = open(COOKIE_SRC, "rb").read().decode(errors="replace")
-        names = []
-        for line in data.splitlines():
-            if not line:
-                continue
-            if line.startswith("#HttpOnly_"):
-                line = line[len("#HttpOnly_"):]
-            elif line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                names.append(parts[5])
-        res.update({
-            "size_bytes": len(data),
-            "cookie_count": len(names),
-            "has_SAPISID": "SAPISID" in names,
-            "has_secure_3PAPISID": "__Secure-3PAPISID" in names,
-            "has_LOGIN_INFO": "LOGIN_INFO" in names,
-            "has_secure_3PSID": "__Secure-3PSID" in names,
-        })
-    return res
+    return {"status": "AURA GRAB backend is running", "cookies_loaded": os.path.exists(COOKIE_FILE)}
 
 
 @app.get("/info")
 def info(url: str = Query(...)):
+    """ভিডিওর টাইটেল/থাম্বনেইল আনে, প্রিভিউ কার্ডে দেখানোর জন্য।"""
     try:
-        opts = _base_opts()
+        opts = base_opts()
+        opts["skip_download"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
-            data = ydl.extract_info(url, download=False, process=False)
-        fmts = list(data.get("formats") or [])
+            data = ydl.extract_info(url, download=False)
         return {
             "title": data.get("title"),
             "thumbnail": data.get("thumbnail"),
-            "author": data.get("uploader") or data.get("channel"),
             "duration": data.get("duration"),
-            "provider": data.get("extractor_key"),
-            "format_count": len(fmts),
-            "has_mp4": any(f.get("ext") == "mp4" for f in fmts),
         }
     except Exception as e:
-        return JSONResponse(content={"error": str(e)})
-
-
-@app.get("/formats")
-def formats(url: str = Query(...)):
-    try:
-        opts = _base_opts()
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            data = ydl.extract_info(url, download=False)
-        seen = set()
-        out = []
-        for f in (data.get("formats") or []):
-            if f.get("vcodec") in (None, "none"):
-                continue
-            h = f.get("height")
-            if not h or h in seen:
-                continue
-            seen.add(h)
-            out.append({
-                "format_id": f.get("format_id"),
-                "height": h,
-                "label": f"{h}p",
-                "ext": f.get("ext"),
-                "filesize": f.get("filesize") or f.get("filesize_approx") or 0,
-            })
-        out.sort(key=lambda x: x["height"], reverse=True)
-        return {"formats": out}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/download")
 def download(url: str = Query(...), format: str = Query("mp4")):
-    fmt = (format or "mp4").lower()
-    if fmt not in ("mp4", "mp3"):
-        return JSONResponse(content={"error": "format must be mp4 or mp3"})
+    """
+    YouTube/TikTok/Instagram/Facebook — যেকোনো লিঙ্ক থেকে yt-dlp দিয়ে
+    আসল স্ট্রিম URL বের করে, সেটা সরাসরি Android অ্যাপের কাছে
+    byte-by-byte স্ট্রিম করে পাঠায়।
+    """
+    if format == "mp4":
+        format_candidates = ["best[ext=mp4]/best", "best", "bestvideo/best"]
+    else:
+        format_candidates = ["bestaudio[ext=m4a]/bestaudio", "bestaudio", "best"]
 
-    tmpdir = tempfile.mkdtemp(prefix="auragrab_")
-    try:
-        opts = _base_opts()
-        if fmt == "mp3":
-            if not FFMPEG_PATH:
-                return JSONResponse(content={"error": "ffmpeg unavailable"})
-            opts.update({
-                "format": "ba/b",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            })
-        else:
-            opts.update({
-                "format": "bv*+ba/b",
-                "merge_output_format": "mp4",
-            })
-        opts["outtmpl"] = os.path.join(tmpdir, "%(id)s.%(ext)s")
+    info_data, err = extract_with_fallback(url, format_candidates)
+    if info_data is None:
+        return JSONResponse(status_code=500, content={"error": f"extract failed: {err}"})
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            base = ydl.prepare_filename(info)
-
-        out = base if os.path.exists(base) else None
-        if not out:
-            for f in os.listdir(tmpdir):
-                if f.endswith(".part") or f.endswith(".ytdl"):
-                    continue
-                out = os.path.join(tmpdir, f)
+    # ফরম্যাট অনুযায়ী আসল ডাউনলোডযোগ্য URL বের করা
+    direct_url = info_data.get("url")
+    if not direct_url and "requested_downloads" in info_data:
+        rd = info_data["requested_downloads"]
+        if rd:
+            direct_url = rd[0].get("url")
+    if not direct_url and "formats" in info_data and info_data["formats"]:
+        # শেষ ভরসা হিসেবে যেকোনো formats এন্ট্রি থেকে সরাসরি url খোঁজা
+        for f in reversed(info_data["formats"]):
+            if f.get("url"):
+                direct_url = f["url"]
                 break
-        if not out or not os.path.exists(out):
-            raise FileNotFoundError("downloaded file not found")
 
-        size = os.path.getsize(out)
-        mime = "audio/mpeg" if fmt == "mp3" else "video/mp4"
-        vid = info.get("id") or "video"
-        fname = f"auragrab_{vid}.{fmt}"
+    if not direct_url:
+        available = [
+            {"itag": f.get("format_id"), "ext": f.get("ext"), "note": f.get("format_note")}
+            for f in info_data.get("formats", [])
+        ]
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No downloadable stream found", "available_formats": available},
+        )
 
-        def iterf() -> Generator[bytes, None, None]:
-            try:
-                with open(out, "rb") as fh:
-                    while True:
-                        chunk = fh.read(64 * 1024)
-                        if not chunk:
-                            break
-                        yield chunk
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+    headers = info_data.get("http_headers") or {}
+    title = info_data.get("title", "download")
+    safe_title = "".join(c for c in title if c.isalnum() or c in " ._-").strip()[:60] or "download"
+    ext = "mp4" if format == "mp4" else "mp3"
+    filename = f"{safe_title}.{ext}"
+    media_type = "video/mp4" if format == "mp4" else "audio/mpeg"
 
-        return StreamingResponse(iterf(), media_type=mime, headers={
-            "Content-Disposition": f'attachment; filename="{fname}"',
-            "Content-Length": str(size),
-            "Cache-Control": "no-store",
-        })
-    except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return JSONResponse(content={"error": f"download failed: {e}"})
+    def stream():
+        with requests.get(direct_url, headers=headers, stream=True, timeout=120) as r:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+
+    return StreamingResponse(
+        stream(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
