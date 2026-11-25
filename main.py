@@ -64,7 +64,6 @@ def _base_opts() -> dict:
         "socket_timeout": 30,
         "extractor_args": {
             "youtube": {
-                # mweb সবচেয়ে বেশি কাজ করে datacenter IP-তে
                 "player_client": ["mweb", "web_safari", "android_vr"],
             }
         },
@@ -99,7 +98,11 @@ def debug_cookies():
         data = Path(COOKIE_SRC).read_text(errors="replace")
         names = []
         for line in data.splitlines():
-            if not line or line.startswith("#"):
+            if not line:
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
                 continue
             parts = line.split("\t")
             if len(parts) >= 7:
@@ -115,6 +118,29 @@ def debug_cookies():
             "rw_writable": os.access(COOKIE_RW, os.W_OK) if os.path.exists(COOKIE_RW) else False,
         })
     return res
+
+
+@app.get("/formats")
+def formats(url: str = Query(...)):
+    """Diagnostic: কোন কোন format available তা দেখায়"""
+    try:
+        opts = _base_opts()
+        opts.pop("format", None)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+        fmts = []
+        for f in (data.get("formats") or []):
+            fmts.append({
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+                "height": f.get("height"),
+                "filesize": f.get("filesize"),
+            })
+        return {"title": data.get("title"), "count": len(fmts), "formats": fmts}
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"error": str(e)})
 
 
 @app.get("/info")
@@ -163,7 +189,7 @@ def download(
                     content={"error": "ffmpeg missing on server (mp3 unavailable)"},
                 )
             opts.update({
-                "format": "bestaudio/best",
+                "format": "bestaudio*/best",
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
@@ -171,9 +197,10 @@ def download(
                 }],
             })
         else:
-            # ffmpeg ছাড়াই কাজ করে
+            # সবচেয়ে permissive selector — merge করে mp4 বানাবে
             opts.update({
-                "format": "best[ext=mp4]/best[ext=webm]/best",
+                "format": "bestvideo*+bestaudio/best",
+                "merge_output_format": "mp4",
             })
 
         opts["outtmpl"] = os.path.join(tmpdir, "%(id)s.%(ext)s")
@@ -182,7 +209,7 @@ def download(
             data = ydl.extract_info(url, download=True)
             base = ydl.prepare_filename(data)
 
-        # final file খুঁজি (mp3 postprocess এ extension বদলায়)
+        # final file খুঁজি
         out_path = None
         if os.path.exists(base):
             out_path = base
