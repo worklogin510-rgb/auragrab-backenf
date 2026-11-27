@@ -30,9 +30,11 @@ def base_opts():
         "noplaylist": True,
         "extractor_args": {
             "youtube": {
-                # tv / web_embedded / android_vr — yt-dlp এর নিজস্ব ডকুমেন্টেশন
-                # অনুযায়ী এই ক্লায়েন্টগুলোর PO-token লাগে না, তাই আগে এগুলো try করবে
-                "player_client": ["tv", "web_embedded", "android_vr", "web"],
+                # "tv" ক্লায়েন্টে এখন yt-dlp এর একটা known bug আছে (তাই এটা
+                # "page needs to be reloaded" এরর দিচ্ছিল) — তাই সেটা বাদ
+                # (-tv_downgraded) দিয়ে, yt-dlp মেইনটেইনারদের নিজেদের
+                # সুপারিশ অনুযায়ী default + web_embedded ব্যবহার করছি
+                "player_client": ["default", "web_embedded", "-tv_downgraded"],
                 # cookies থাকার পরেও কিছু ফরম্যাট PO-token এর কারণে লুকানো থাকে —
                 # এটা সেগুলোকেও candidate হিসেবে বিবেচনা করতে বলে (fallback হিসেবে)
                 "formats": ["missing_pot"],
